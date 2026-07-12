@@ -21,11 +21,16 @@ previous "unmerged/blocked" note was stale).
    speculative.cpp hardcoded non-causal for all drafts. Converter now writes
    `dflash.attention.causal`; speculative.cpp reads it (absent → non-causal, so qwen3
    GGUFs unchanged). On code: causal 36.1%/6.32 vs non-causal 29.2%/5.31.
-2. **SWA** — the merged reference REMOVES the sliding window at attention compute
-   (`attn.sliding_window = None`, no proposer-side mask), i.e. the drafter runs full
-   attention. Use the `DFLASH_NO_SWA=1`-converted GGUF (neutral for ctx<512, matters
-   beyond). **Primary draft GGUF: `~/models/gguf/Laguna-XS-2.1-DFlash-F16-noswa.gguf`
-   (causal, no SWA).**
+2. **SWA — CORRECTED (benchmark session, same night): KEEP the trained SWA-512.**
+   Earlier conclusion ("use the no-SWA GGUF to match the merged vLLM reference")
+   was wrong at long context: the drafter is TRAINED all-sliding-512, and running
+   it full-attention collapses acceptance once context ≫ window (Q4, code task:
+   512-tok prompt 0.325 both; ~7.8K-tok prompt **no-SWA 0.001 vs SWA 0.280**).
+   The merged vLLM reference strips the window (`attn.sliding_window = None`) and
+   would have the same long-context collapse — its e2e test only uses tiny prompts,
+   so upstream never noticed (candidate upstream bug report). **Primary draft GGUF:
+   `~/models/gguf/Laguna-XS-2.1-DFlash-F16.gguf` (causal, SWA-512 kept).** The
+   noswa file is kept only as an A/B artifact.
 3. **KV-injection input_layernorm** — reference `_project_context_kv` applies each
    layer's input_layernorm to the fused context state before K/V projection; added
    (gated on `enc_aux_norm` presence → qwen3 path untouched). NOTE: mathematically a
@@ -53,12 +58,12 @@ previous "unmerged/blocked" note was stale).
 ```bash
 cd ~/Dev/llama.cpp-laguna && cmake --build build -j 20
 ./build/bin/llama-server -m ~/models/gguf/Laguna-XS-2.1-Q4_K_M.gguf \
-  -md ~/models/gguf/Laguna-XS-2.1-DFlash-F16-noswa.gguf --spec-type draft-dflash \
+  -md ~/models/gguf/Laguna-XS-2.1-DFlash-F16.gguf --spec-type draft-dflash \
   --spec-draft-n-max 15 -c 10240 --parallel 1 -ngl 99 -fa on --jinja --port 8080
 # code prompt via /completion (raw, no chat template) → acceptance ~0.36 in log.
-# Reconvert draft (writes causal key; DFLASH_NO_SWA=1 for the primary no-swa file):
-DFLASH_NO_SWA=1 PYTHONPATH=gguf-py ~/venvs/vllm/bin/python convert_hf_to_gguf.py \
-  ~/models/hf/Laguna-XS-2.1-DFlash --outfile ~/models/gguf/Laguna-XS-2.1-DFlash-F16-noswa.gguf \
+# Reconvert draft (writes causal key; keep SWA — do NOT set DFLASH_NO_SWA):
+PYTHONPATH=gguf-py ~/venvs/vllm/bin/python convert_hf_to_gguf.py \
+  ~/models/hf/Laguna-XS-2.1-DFlash --outfile ~/models/gguf/Laguna-XS-2.1-DFlash-F16.gguf \
   --outtype f16 --target-model-dir ~/models/hf/Laguna-XS-2.1
 ```
 
