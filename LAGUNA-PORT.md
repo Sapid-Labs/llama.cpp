@@ -117,8 +117,21 @@ sigmoid gating func, exp_probs_b; qwen3moe has qk-norm + shared expert;
 gemma2/cohere2 have sliding_window + per-layer attn type).
 
 ## Build plan (iterative)
-1. **convert_hf_to_gguf.py `LagunaModel`** — produce a GGUF, all tensors mapped,
-   metadata written. Testable immediately (no C++ rebuild). *(in progress)*
+1. **convert_hf_to_gguf.py `LagunaModel`** — ✅ **DONE** (`conversion/laguna.py`).
+   Produces `Laguna-XS-2.1-BF16.gguf` (66.9 GB, 678 tensors); metadata verified:
+   per-layer `head_count=[48,64,64,64,…]`, `head_count_kv=8`, `rope.dim=64`,
+   `sliding_window=512` + pattern `[F,T,T,T]×`, 256 experts/8 used, weights_scale
+   2.5, gating=sigmoid, shared=1, `tokenizer.ggml.pre=laguna`.
+   - **On-disk facts discovered:** experts are stored **per-expert** (separate
+     `gate_proj`/`up_proj`/`down_proj`, NOT fused) → merged into 3D in convert.
+     Correction bias arrives as `mlp.experts.e_score_correction.bias` (loader
+     dot-normalizes `_bias`) → rerouted to `mlp.gate.e_score_correction`.
+   - **Tokenizer:** GPT-2/GPT-4-style byte-level BPE, chkhsh
+     `972da7b5…`, registered as pre-tokenizer `laguna`. ⚠️ transformers warns
+     the checkpoint's regex is the "mistral incorrect regex" variant
+     (`fix_mistral_regex`) — **must use the exact tokenizer.json regex for the
+     C++ `laguna` pretokenizer**, and verify tokenization vs HF before trusting
+     output.
 2. **C++ arch** — `llama-arch.{h,cpp}` (enum `LLM_ARCH_LAGUNA`, tensor names, KV),
    `llama-hparams` fields, `llama-model.cpp` load_hparams + load_tensors.
 3. **Graph** — `llm_build_laguna` in `llama-model.cpp`: QK-norm attn, per-layer
