@@ -5,6 +5,36 @@ Convention for this file: see `~/CLAUDE.md` → "Session handoffs".
 
 ---
 
+## 2026-07-12 (evening) — DFlash draft support: implemented, acceptance ~10% (blocked on reference)
+
+### STATUS
+DFlash-Laguna speculator ported (commit `34e0062`, branch `laguna-support`). **Works**
+(loads, correct output, acceptance > 0) but acceptance is only **~10%** vs ~45% for the
+qwen3 dflash → net slowdown. Not published. **Base Laguna ruled out** (llama.cpp logits
+match vLLM); residual gap is in the draft forward, blocked on there being no working
+DFlash-Laguna reference (vLLM PR #46853 unmerged, 0.24.0 back-port numerically wrong).
+
+### WHAT'S IN THE COMMIT
+- `conversion/qwen.py` `DFlashLagunaModel` (fused-qkv split, g_proj→gate, aux_hidden_norms
+  → stacked `enc.aux_norm`, all-sliding SWA, dense expert-count zeroing; env gates
+  `DFLASH_NO_{GATE,AUX,SWA}` for diagnostics). New `enc.aux_norm` tensor (llama-arch + gguf-py).
+- `dflash` graph: encoder aux-RMSNorm before fc; decode softplus per-head gate (both gated on
+  tensor presence — qwen3 dflash unchanged).
+- `llama-context.cpp`: `embeddings_layer_inp` supports `lid == n_layer` (extract final-layer
+  output); `laguna.cpp` registers `t_layer_inp` per layer + final residual.
+- Draft GGUF: `~/models/gguf/Laguna-XS-2.1-DFlash-F16.gguf`.
+
+### HOW TO RESUME / REPRODUCE
+```bash
+./build/bin/llama-server -m ~/models/gguf/Laguna-XS-2.1-Q4_K_M.gguf \
+  -md ~/models/gguf/Laguna-XS-2.1-DFlash-F16.gguf --spec-type draft-dflash \
+  --spec-draft-n-max 15 -c 10240 --parallel 1 -ngl 99 -fa on --jinja --port 8080
+# server logs "draft acceptance = 0.1x". Full findings + resume plan:
+#   ~/Dev/howtospark/models/laguna-xs-2-1.md (DFlash section)
+```
+
+---
+
 ## 2026-07-12 (pm) — C++ port DONE, runs & generates coherently ✅
 
 ### STATUS
