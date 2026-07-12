@@ -126,9 +126,41 @@ gemma2/cohere2 have sliding_window + per-layer attn type).
    with correction bias + softcap + routed scaling + shared expert.
 4. **Build CUDA (GB10 sm_121)** + smoke test + logits diff vs HF reference.
 
-## Reference archs to crib (all in this tree)
-- `qwen3moe` — QK-norm, MoE + shared expert, base structure.
-- `deepseek2` — sigmoid routing, `exp_probs_b` correction bias, routed scaling.
-- `cohere2` / `gemma2` — mixed sliding/full attention + per-layer masks.
-- `qwen3next` — gated attention output.
-- `glm` (or persimmon/stablelm) — partial rotary (`n_rot < head_dim`).
+## PRIMARY TEMPLATE: `STEP35` (Step 3.5) — near-identical architecture
+Research (2026-07-12) found `STEP35` already implements almost all of Laguna:
+- **head-wise attention gate** (`self_attn.g_proj` → `ATTN_GATE`; tensor_mapping.py
+  line 387 literally says "step3.5 head-wise attention gate") ✓
+- **QK-norm** ✓, **sigmoid MoE + `exp_probs_b` correction bias + shared expert** ✓
+- **mixed `layer_types` + sliding window + per-type rope** — `conversion/step3.py`
+  already splits `rope_theta` into full vs `sliding_attention` and emits
+  sliding-window metadata ✓
+
+**Plan is now: clone STEP35 (converter `conversion/step3.py` `Step35Model` + its
+C++ `llm_build_step35` graph + `LLM_ARCH_STEP35` wiring), rename to `laguna`, and
+add only the deltas below.** Most GGUF infra already exists (ATTN_GATE,
+FFN_EXP_PROBS_B, add_expert_weights_scale, add_expert_gating_func=sigmoid,
+add_head_count(sequence), add_rope_dimension_count + _swa, add_sliding_window).
+
+### Deltas Laguna needs on top of STEP35 (verify each during impl)
+1. **Per-layer variable query heads** (48 full / 64 sliding) — STEP35 likely
+   constant. Emit `add_head_count([...])` from `num_attention_heads_per_layer`;
+   ensure C++ load + graph honor per-layer `n_head`. *(biggest delta)*
+2. **Partial rotary on full-attention layers** (`n_rot=64`, YaRN θ=500k, factor
+   32, orig_ctx 8192) vs **full rotary on sliding** (`n_rot=128`, θ=10k). Map to
+   `rope_dimension_count=64` + `rope_dimension_count_swa=128`; set YaRN
+   (freq_scale, ext_factor, beta_fast/slow) for the full-layer rope only. Confirm
+   the STEP35 graph applies rope per-layer-type (it has the two thetas already).
+3. **`moe_routed_scaling_factor=2.5`** → `add_expert_weights_scale(2.5)`
+   (STEP35 may default to 1.0).
+4. **Fused expert weights**: HF `experts.gate_up_proj [E,2*512,2048]` +
+   `down_proj [E,2048,512]`. Split gate_up → `ffn_gate_exps`/`ffn_up_exps` in
+   `modify_tensors` (STEP35's experts may already be split — check).
+5. **Correction-bias key** is `mlp.gate.e_score_correction_bias` (note `_bias`
+   suffix) — add mapping or strip suffix (cf. AFMOE's `filter_tensors`).
+6. **softcap OFF** (`moe_router_logit_softcapping` default 0.0 here) — skip.
+7. Attention sinks **off** (`swa_attention_sink_enabled=False`) — skip.
+
+### Other archs to crib for specific deltas
+- `deepseek2` — routed scaling / sigmoid gating details.
+- `glm` / stablelm — partial rotary (`n_rot < head_dim`) if STEP35 lacks it.
+- `qwen3moe` — fused-expert split reference.
