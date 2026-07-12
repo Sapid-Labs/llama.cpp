@@ -921,6 +921,35 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
 
+    // DFLASH_DUMP=<dir>: dump encoder inputs/outputs and block logits for
+    // offline numerical comparison against a PyTorch reference.
+    std::string dump_dir = getenv("DFLASH_DUMP") ? getenv("DFLASH_DUMP") : "";
+
+    void dump_rec(const char * name, const int32_t * tokens, const llama_pos * pos, int32_t n_tokens,
+                  const float * data, int32_t n_dim) const {
+        if (dump_dir.empty()) {
+            return;
+        }
+        FILE * f = fopen((dump_dir + "/" + name + ".bin").c_str(), "ab");
+        if (!f) {
+            return;
+        }
+        fwrite(&n_tokens, sizeof(int32_t), 1, f);
+        fwrite(&n_dim,    sizeof(int32_t), 1, f);
+        std::vector<int32_t> tok(n_tokens, -1);
+        if (tokens) {
+            std::copy(tokens, tokens + n_tokens, tok.begin());
+        }
+        fwrite(tok.data(), sizeof(int32_t), n_tokens, f);
+        std::vector<int32_t> p(n_tokens, -1);
+        if (pos) {
+            for (int32_t i = 0; i < n_tokens; ++i) { p[i] = (int32_t) pos[i]; }
+        }
+        fwrite(p.data(), sizeof(int32_t), n_tokens, f);
+        fwrite(data, sizeof(float), (size_t) n_tokens * n_dim, f);
+        fclose(f);
+    }
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, n_seq)
         , params(params.draft)
@@ -980,7 +1009,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
-        llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
+
+        // qwen3-style DFlash drafts run NON-causal block attention; the laguna
+        // draft is trained causal (dflash_config.causal=true). The converter
+        // writes dflash.attention.causal accordingly; GGUFs without the key
+        // (qwen3 drafts) default to non-causal.
+        bool causal_dft = false;
+        {
+            char buf[16] = {};
+            if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0) {
+                causal_dft = strcmp(buf, "true") == 0;
+            }
+        }
+        LOG_INF("%s: - draft block attention: %s\n", __func__, causal_dft ? "causal" : "non-causal");
+        llama_set_causal_attn(ctx_dft, causal_dft);
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1081,6 +1123,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
+                if (!dump_dir.empty() && seq_id == 0) {
+                    dump_rec("feat",  batch_in.token + i_batch_beg[seq_id] + offset,
+                             batch_in.pos + i_batch_beg[seq_id] + offset, n_chunk, features_buf.data(), n_embd_enc);
+                    dump_rec("fused", batch_in.token + i_batch_beg[seq_id] + offset,
+                             batch_in.pos + i_batch_beg[seq_id] + offset, n_chunk, inp_g, n_embd_dec);
+                }
+
                 // inject the DFlash decoder K/V cache at the tokens' target positions
                 batch_inject.n_tokens = n_chunk;
                 std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
@@ -1145,6 +1194,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
+        }
+
+        if (!dump_dir.empty() && i_block_beg[0] >= 0) {
+            const llama_model * model_dft = llama_get_model(ctx_dft);
+            const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+            const int32_t beg = i_block_beg[0];
+            const int32_t n   = n_block[0];
+            std::vector<float> logits((size_t) n * n_vocab);
+            for (int32_t i = 0; i < n; ++i) {
+                const float * l = llama_get_logits_ith(ctx_dft, beg + i);
+                std::memcpy(logits.data() + (size_t) i * n_vocab, l, (size_t) n_vocab * sizeof(float));
+            }
+            dump_rec("block", batch.token + beg, batch.pos + beg, n, logits.data(), n_vocab);
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

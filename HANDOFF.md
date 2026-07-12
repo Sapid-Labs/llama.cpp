@@ -5,7 +5,72 @@ Convention for this file: see `~/CLAUDE.md` → "Session handoffs".
 
 ---
 
-## 2026-07-12 (evening) — DFlash draft support: implemented, acceptance ~10% (blocked on reference)
+## 2026-07-12 (night) — DFlash WORKING: 36% acceptance / 1.43× net speedup on code ✅
+
+### STATUS
+DFlash-Laguna speculation **works and is a net win on code**: Q4_K_M target + F16
+draft on the code-continuation prompt gives **acceptance 36.1%, mean draft len 6.32,
+132.8 tok/s vs 93.1 baseline (1.43×)**. On chat/reasoning output acceptance is ~11%
+(net slowdown) — **content-dependent, not a bug**. Implementation validated stage-by-
+stage against the now-**MERGED** vLLM reference (PR #46853 merged 2026-07-03; the
+previous "unmerged/blocked" note was stale).
+
+### ROOT CAUSES FOUND (vs yesterday's ~10%-everywhere)
+1. **Causal block attention** — Laguna's draft is trained CAUSAL
+   (`dflash_config.causal=true` in its config.json); qwen3 dflash is non-causal and
+   speculative.cpp hardcoded non-causal for all drafts. Converter now writes
+   `dflash.attention.causal`; speculative.cpp reads it (absent → non-causal, so qwen3
+   GGUFs unchanged). On code: causal 36.1%/6.32 vs non-causal 29.2%/5.31.
+2. **SWA** — the merged reference REMOVES the sliding window at attention compute
+   (`attn.sliding_window = None`, no proposer-side mask), i.e. the drafter runs full
+   attention. Use the `DFLASH_NO_SWA=1`-converted GGUF (neutral for ctx<512, matters
+   beyond). **Primary draft GGUF: `~/models/gguf/Laguna-XS-2.1-DFlash-F16-noswa.gguf`
+   (causal, no SWA).**
+3. **KV-injection input_layernorm** — reference `_project_context_kv` applies each
+   layer's input_layernorm to the fused context state before K/V projection; added
+   (gated on `enc_aux_norm` presence → qwen3 path untouched). NOTE: mathematically a
+   NO-OP for this checkpoint (all 5 input_layernorm weights are exactly 1.0 and fused
+   states have unit RMS) — kept for reference fidelity.
+4. The rest of the residual gap is **content**: the model card's ~70% is on coding;
+   chat `<think>` reasoning prose drafts at ~11%. A faithful fp32 PyTorch reference
+   achieves the same (2.05 vs llama.cpp's 1.90 accepted/block on the chat dump), so
+   llama.cpp is NOT leaving acceptance on the table.
+
+### VALIDATION DONE (proof)
+- **Encoder**: llama.cpp fused states match fp32 reference, ~0.2% rel err.
+- **Block logits**: 88% top-1 agreement w/ fp32 causal reference (F16/Q4 noise);
+  non-causal reference clearly disagrees (38%) → causal path really active.
+- **Target aux extraction**: hooked real vLLM (base Laguna BF16, in-process V1) at
+  layers [2,14,26,34,40]-entry (= `target_layer_ids+1`, hidden+residual, pre-final-
+  norm) and compared with llama.cpp's `feat.bin`: cosine 0.96–1.00 per position; the
+  ~8% magnitude diff is Q4-vs-BF16 target noise. Extraction mapping is CORRECT.
+- Tools (scratchpad of this session): `ref_dflash.py` (fp32 reference + stage diffs),
+  `ref_acceptance.py` (offline acceptance from dumps), `vllm_aux_capture.py`
+  (vLLM hook comparison). `DFLASH_DUMP=<dir>` env in speculative.cpp dumps
+  feat/fused/block records (binary: n_tok,n_dim,toks,pos,data per record).
+
+### HOW TO RESUME / REPRODUCE
+```bash
+cd ~/Dev/llama.cpp-laguna && cmake --build build -j 20
+./build/bin/llama-server -m ~/models/gguf/Laguna-XS-2.1-Q4_K_M.gguf \
+  -md ~/models/gguf/Laguna-XS-2.1-DFlash-F16-noswa.gguf --spec-type draft-dflash \
+  --spec-draft-n-max 15 -c 10240 --parallel 1 -ngl 99 -fa on --jinja --port 8080
+# code prompt via /completion (raw, no chat template) → acceptance ~0.36 in log.
+# Reconvert draft (writes causal key; DFLASH_NO_SWA=1 for the primary no-swa file):
+DFLASH_NO_SWA=1 PYTHONPATH=gguf-py ~/venvs/vllm/bin/python convert_hf_to_gguf.py \
+  ~/models/hf/Laguna-XS-2.1-DFlash --outfile ~/models/gguf/Laguna-XS-2.1-DFlash-F16-noswa.gguf \
+  --outtype f16 --target-model-dir ~/models/hf/Laguna-XS-2.1
+```
+
+### NEXT (optional)
+- Benchmark rows for howtospark: spec-decoding profile on CODE workloads (that's
+  where the win is); chat/reasoning rows would show a slowdown — bench both honestly.
+- Diagnostic env gates available: `DFLASH_NO_{GATE,AUX,SWA}` (converter),
+  `DFLASH_NO_INJ_NORM`, `DFLASH_DUMP` (runtime).
+
+---
+
+## 2026-07-12 (evening) — DFlash draft support: implemented, acceptance ~10% (SUPERSEDED — see above)
 
 ### STATUS
 DFlash-Laguna speculator ported (commit `34e0062`, branch `laguna-support`). **Works**

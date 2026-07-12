@@ -717,6 +717,11 @@ class DFlashLagunaModel(DFlashModel):
         if block_size is not None:
             self.gguf_writer.add_block_size(int(block_size))
 
+        # The Laguna draft is trained with CAUSAL block attention
+        # (dflash_config.causal=true); the qwen3 dflash draft is non-causal.
+        # speculative.cpp reads this key to pick the draft attention mode.
+        self.gguf_writer.add_causal_attention(bool(hp.get("dflash_config", {}).get("causal", False)))
+
         # The draft is dense; its config carries a stale num_experts_per_tok that
         # the base emits as expert_used_count=8 (with expert_count=0), tripping the
         # n_expert_used <= n_expert assert on load. Force both to zero.

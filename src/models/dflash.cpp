@@ -167,8 +167,18 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
 
-            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g);
-            ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g);
+            // dflash-laguna: the reference projects context K/V from each layer's
+            // input_layernorm of the fused context state (vLLM _project_context_kv
+            // stacks layer.input_layernorm weights). The qwen3 draft projects the
+            // raw fused state (its single hidden_norm is folded into the encoder).
+            ggml_tensor * kv_inp = inp_g;
+            if (model.enc_aux_norm && !getenv("DFLASH_NO_INJ_NORM")) { // env gate: acceptance diagnostics
+                kv_inp = build_norm(inp_g, layer.attn_norm, NULL, LLM_NORM_RMS, il);
+                cb(kv_inp, "inp_g_norm", il);
+            }
+
+            ggml_tensor * Kcur = build_lora_mm(layer.wk, kv_inp);
+            ggml_tensor * Vcur = build_lora_mm(layer.wv, kv_inp);
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
