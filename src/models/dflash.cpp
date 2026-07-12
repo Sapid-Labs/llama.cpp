@@ -40,6 +40,11 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
 
+    // dflash-laguna: per-target-layer RMSNorm weights applied to each extracted
+    // hidden state before concat+fc. Stacked as [n_embd, n_target_layers]. Absent
+    // for the qwen3 dflash draft (which does not aux-norm its features).
+    enc_aux_norm = create_tensor(tn(LLM_TENSOR_ENC_AUX_NORM, "weight"), { n_embd, (int64_t) target_layer_ids.size() }, TENSOR_NOT_REQUIRED);
+
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
@@ -52,6 +57,10 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+
+        // head-wise softplus attention gate (dflash-laguna self_attn.g_proj).
+        // Absent for the qwen3 dflash draft.
+        layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), { n_embd, n_head }, TENSOR_NOT_REQUIRED);
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
@@ -91,6 +100,21 @@ ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
 template <>
 llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd_enc();
+
+    // dflash-laguna: RMS-norm each extracted target hidden by its own aux weight
+    // BEFORE fusion. Input is [n_target*n_embd, n_tokens], per-token layout is the
+    // target_layer_ids order [layer0_embd, layer1_embd, ...]; reshape to
+    // [n_embd, n_target, n_tokens] so ggml_rms_norm normalizes each slice
+    // independently, then scale by the per-slice weight [n_embd, n_target, 1].
+    if (model.enc_aux_norm) {
+        const int64_t n_tgt = model.enc_aux_norm->ne[1];
+        ggml_tensor * x = ggml_reshape_3d(ctx0, cur, n_embd, n_tgt, n_tokens);
+        x = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+        ggml_tensor * w = ggml_reshape_3d(ctx0, model.enc_aux_norm, n_embd, n_tgt, 1);
+        x = ggml_mul(ctx0, x, w);
+        cur = ggml_reshape_2d(ctx0, x, n_embd * n_tgt, n_tokens);
+        cb(cur, "enc_aux_normed", -1);
+    }
 
     cur = build_lora_mm(model.fc, cur);
     cb(cur, "fc_out", -1);
@@ -229,10 +253,26 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
 
-        // cache-aware, non-causal attention
+        // cache-aware attention. For the dflash-laguna draft a head-wise softplus
+        // gate is applied to the attention output before o_proj, so run attention
+        // with wo=NULL and project manually; the qwen3 draft (no gate) keeps wo fused.
+        ggml_tensor * wo_attn = layer.wqkv_gate ? nullptr : layer.wo;
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, wo_attn, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      wo_attn, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+
+        // head-wise softplus attention gate (dflash-laguna), identical to base laguna
+        if (layer.wqkv_gate) {
+            ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, noise_norm); // [n_head, n_tokens]
+            gate = ggml_softplus(ctx0, gate);
+            ggml_tensor * attn_3d = ggml_reshape_3d(ctx0, cur,  n_embd_head, n_head, n_tokens);
+            ggml_tensor * gate_3d = ggml_reshape_3d(ctx0, gate, 1,           n_head, n_tokens);
+            attn_3d = ggml_mul(ctx0, attn_3d, gate_3d);
+            cur = ggml_reshape_2d(ctx0, attn_3d, n_embd_head * n_head, n_tokens);
+            cb(cur, "attn_gated", il);
+            cur = build_lora_mm(layer.wo, cur);
+            cb(cur, "attn_proj", il);
+        }
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
         cb(ffn_inp, "ffn_inp", il);

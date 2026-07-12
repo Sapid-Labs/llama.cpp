@@ -125,6 +125,9 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
+        // expose this layer's input residual for DFlash/EAGLE draft extraction
+        res->t_layer_inp[il] = inpL;
+
         const uint32_t n_head_l    = hparams.n_head(il);
         const uint32_t n_head_kv_l = hparams.n_head_kv(il);
 
@@ -261,6 +264,10 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
     }
 
     cur = inpL;
+
+    // final layer output, exposed for DFlash/EAGLE draft extraction as the input
+    // to the notional layer n_layer (must stay full-length, before out-id gather)
+    res->t_layer_inp[n_layer] = cur;
 
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);

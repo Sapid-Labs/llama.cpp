@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Iterable, TYPE_CHECKING
 
 import torch
@@ -673,3 +674,88 @@ class DFlashModel(Qwen3Model):
         if not name.startswith("model."):
             name = "model." + name
         return super().filter_tensors((name, gen))
+
+
+@ModelBase.register("DFlashLagunaForCausalLM")
+class DFlashLagunaModel(DFlashModel):
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    """DFlash draft for poolside Laguna-XS-2.1 (decoder_layer_type='laguna_xs').
+
+    Same DFlash wiring as the Qwen3 draft (fc feature-fusion, target-layer
+    extraction, shared target vocab / lm_head) but the decoder block is a Laguna
+    layer: a fused ``qkv_proj``, a per-head softplus attention gate (``g_proj``),
+    QK-norm, and — unique to DFlash-Laguna — per-target-layer ``aux_hidden_norms``
+    applied to each extracted hidden state before fusion. All 5 layers are
+    sliding-window (512). Emits the same DFLASH GGUF arch; the C++ side turns on
+    the gate / aux-norm paths by tensor presence.
+    """
+
+    _aux_norms: dict[int, Tensor] | None = None
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        hp = self.hparams
+        # Laguna head_dim is explicit (n_embd/n_head would give the wrong value).
+        head_dim = int(hp["head_dim"])
+        self.gguf_writer.add_key_length(head_dim)
+        self.gguf_writer.add_value_length(head_dim)
+
+        # Every decoder layer uses sliding-window attention (window 512). The base
+        # DFlashModel only emits SWA when use_sliding_window is truthy (it is None
+        # here), so drive it from layer_types directly.
+        layer_types = hp.get("layer_types") or ["sliding_attention"] * self.block_count
+        sliding_window = hp.get("sliding_window")
+        import os
+        if sliding_window and not os.environ.get("DFLASH_NO_SWA"):
+            self.gguf_writer.add_sliding_window(int(sliding_window))
+            self.gguf_writer.add_sliding_window_pattern([lt == "sliding_attention" for lt in layer_types])
+
+        # block_size lives under dflash_config for this checkpoint.
+        block_size = hp.get("dflash_config", {}).get("block_size")
+        if block_size is not None:
+            self.gguf_writer.add_block_size(int(block_size))
+
+        # The draft is dense; its config carries a stale num_experts_per_tok that
+        # the base emits as expert_used_count=8 (with expert_count=0), tripping the
+        # n_expert_used <= n_expert assert on load. Force both to zero.
+        self.gguf_writer.add_expert_count(0)
+        self.gguf_writer.add_expert_used_count(0)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        import os
+        # diagnostic env gates to isolate acceptance regressions
+        if os.environ.get("DFLASH_NO_GATE") and name.endswith("self_attn.g_proj.weight"):
+            return
+        if os.environ.get("DFLASH_NO_AUX") and "aux_hidden_norms" in name:
+            return
+
+        # fused qkv_proj -> separate q / k / v (contiguous [q; k; v] on the out dim)
+        if name.endswith("self_attn.qkv_proj.weight"):
+            hp = self.hparams
+            n_head = int(hp["num_attention_heads"])
+            n_kv   = int(hp["num_key_value_heads"])
+            hd     = int(hp["head_dim"])
+            q_dim, kv_dim = n_head * hd, n_kv * hd
+            q, k, v = torch.split(data_torch, [q_dim, kv_dim, kv_dim], dim=0)
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_Q, bid, ".weight"), q)
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K, bid, ".weight"), k)
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_V, bid, ".weight"), v)
+            return
+
+        # per-target-layer aux hidden-state norms -> stack into one [n_target, n_embd]
+        # tensor (index order == target_layer_ids order == speculative.cpp interleave).
+        m = re.search(r"aux_hidden_norms\.(\d+)\.weight$", name)
+        if m:
+            n_tgt = len(self.hparams.get("dflash_config", {}).get("target_layer_ids", []))
+            if self._aux_norms is None:
+                self._aux_norms = {}
+            self._aux_norms[int(m.group(1))] = data_torch
+            if len(self._aux_norms) < n_tgt:
+                return
+            stacked = torch.stack([self._aux_norms[i] for i in range(n_tgt)], dim=0)
+            yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ENC_AUX_NORM] + ".weight", stacked)
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
