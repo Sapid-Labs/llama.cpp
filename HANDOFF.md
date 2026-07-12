@@ -5,6 +5,73 @@ Convention for this file: see `~/CLAUDE.md` → "Session handoffs".
 
 ---
 
+## 2026-07-12 (pm) — C++ port DONE, runs & generates coherently ✅
+
+### STATUS
+`LLM_ARCH_LAGUNA` fully ported to llama.cpp C++ and **working**. Model loads on the
+GB10 (CUDA sm_121) and generates coherent, sustained greedy output.
+- Repo **`Sapid-Labs/llama.cpp`**, branch **`laguna-support`**, worktree **`~/Dev/llama.cpp-laguna`**.
+- Build: `~/Dev/llama.cpp-laguna/build` (CUDA sm_121). Binaries: `llama-completion`,
+  `llama-tokenize`. Perf: ~34 tok/s eval, ~134 tok/s prompt, load ~120–160s (66.9 GB BF16).
+
+### DONE (verified this session)
+- **C++ arch wiring** — `LLM_ARCH_LAGUNA` enum+name (`llama-arch.{h,cpp}`), factory +
+  NEOX rope type + `LLM_TYPE_33B_A3B` (`llama-model.{h,cpp}`), `get_can_shift()=false`
+  for per-layer rope (`llama-kv-cache.cpp`).
+- **Model struct + graph** — `src/models/laguna.cpp` (+ struct in `models.h`). Cloned
+  from `STEP35` trunk. **Two deltas vs STEP35 that matter:**
+    1. **Do NOT halve `n_rot_full`** — Laguna's converter already writes the partial
+       rope dim (64) directly; STEP35 writes 128 and halves. (full=64 / swa=128.)
+    2. **Attention gate is `softplus`, NOT sigmoid** — `modeling_laguna.py:459`
+       `F.softplus(g_proj(x))`, per-head (`config "gating":"per-head"`). STEP35 uses
+       sigmoid. `ggml_softplus` exists (ggml.h:1007). *This was the one easy-to-miss bug.*
+  Also dropped all NextN/MTP code (Laguna has none → single `graph`, no `graph_mtp`).
+- **`laguna` pre-tokenizer** — `LLAMA_VOCAB_PRE_TYPE_LAGUNA=56` (`llama-vocab.h`),
+  string-match + `clean_spaces=false` + regex case (`llama-vocab.cpp`). Regex = GROK_2's
+  (single `\p{N}` GPT-4 / "mistral incorrect regex") + newline-merge `(?:\r?\n)+(?!\r?\n)`.
+- **Everything else reused from STEP35 verbatim and confirmed correct for Laguna:** per-layer
+  `n_head` (48 full/64 swa, KV=8), dual RoPE (YaRN θ500k factor32 on full only — YaRN is a
+  no-op on swa because their `freq_scale=1.0`), sigmoid MoE + `exp_probs_b` correction bias
+  + `norm_topk` + ×2.5 routed scale + shared expert, QK-norm, leading-dense layer 0.
+
+### CORRECTNESS GATES — results
+1. **Tokenization vs HF AutoTokenizer: EXACT MATCH** on 6 strings incl. multi-digit
+   numbers, code w/ newlines+indentation, tabs, unicode. (script:
+   `…/scratchpad/toktest.py`, uses `~/venvs/vllm/bin/python`.)
+2. **Greedy generation: coherent & sustained** — 200 tokens temp=0, correct Fibonacci
+   reasoning (0-based vs 1-based, recursion-vs-DP), zero degradation. Rules out any
+   graph bug (rope/gate/MoE/qk-norm) — those compound to garbage over 200 tok.
+3. **NOT YET DONE (optional rigor):** per-token logits diff vs vLLM/HF greedy reference.
+   Functional evidence is already strong; do this only if bit-exact parity is needed.
+
+### NEXT (optional)
+- Commit is on `laguna-support` (this session). Push to `Sapid-Labs/llama.cpp` when ready.
+- Rigorous logits-diff vs vLLM (`~/venvs/vllm`, vLLM-Moet port already runs this model).
+- Quantize (Q4_K_M etc.) + re-verify coherence.
+- Downstream: add llama.cpp Laguna benchmark rows in the `howtospark` repo (its own workflow).
+- Upstream PR to ggml-org/llama.cpp would need the NextN/STEP35-clone lineage cleaned up.
+
+### HOW TO RESUME (commands)
+```bash
+cd ~/Dev/llama.cpp-laguna
+cmake --build build -j 20                    # incremental
+# generate (needs --jinja; model has a custom chat template llama.cpp's default engine rejects):
+./build/bin/llama-completion -m ~/models/gguf/Laguna-XS-2.1-BF16.gguf \
+  -p "Write a Python function that returns the nth Fibonacci number." -n 200 -ngl 99 --temp 0 --jinja
+# tokenizer parity:
+~/venvs/vllm/bin/python /tmp/.../scratchpad/toktest.py   # (recreate from this handoff if gone)
+```
+
+### GOTCHAS discovered this session
+- **`--jinja` is required** to generate: the model's custom chat template throws
+  `this custom template is not supported` in llama.cpp's default template engine.
+  `-no-cnv` is not a `llama-completion` flag (use `llama-cli`→`llama-completion` rename).
+- Tensor-name map in this fork is a **flat** `LLM_TENSOR_NAMES` (not per-arch), and
+  `src/models/*.cpp` is a **CMake GLOB** — dropping `laguna.cpp` in auto-registers it.
+- The 66.9 GB BF16 GGUF cold-loads in ~120–160s; budget for it in each test iteration.
+
+---
+
 ## 2026-07-12 — converter done, C++ half next
 
 ### STATUS
